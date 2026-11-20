@@ -1,0 +1,526 @@
+## Back-cast stand age to a historical epoch (plan §D, task D2).
+##
+## The current condition classifies CEF's `SIFA` -- stand age as of the layer's 2024 compilation --
+## into seral stages. An epoch is built the same way from an *epoch* `SIFA`, so everything from
+## `create_forest_disturbance_seral()` onwards runs unchanged; only the age going in differs.
+##
+## Per polygon, with `shift = data_year - epoch`:
+##
+## | case | age at the epoch | `age_source` |
+## |---|---|---|
+## | no stand-replacing disturbance on record | `SIFA - shift` | `undisturbed` |
+## | the most recent stand-replacing disturbance (`MRSRD_Y`) is at or before the epoch | `SIFA - shift`, floored at 0 | `reset_by_epoch` |
+## | `MRSRD_Y` is after the epoch, and an earlier reset in `DSTRB_HIST` is at or before it | `epoch - year` of the latest such reset | `earlier_reset` |
+## | `MRSRD_Y` is after the epoch, and VRI still holds the pre-disturbance age (more than `vri_update_tolerance` over the years since it) | `PROJ_AGE_1 - shift` | `vri_pre_disturbance` |
+## | otherwise: the age before the disturbance is not recorded | `lost_age` | `lost` |
+##
+## `replaced_year` records, for `lost` rows, the year the unrecorded stand was replaced, which is
+## what `impute_lost_age()` needs.
+##
+## `MRSRD_Y` is CEF's own reset decision, and it is taken as authoritative for the latest reset: an
+## event after it was judged by CEF not to replace the stand (e.g. `2011_IBM_V` on a stand cut in
+## 2007), so at any epoch from 2007 on that stand dates from 2007. `reset_rule` is applied only when
+## `MRSRD_Y` is after the epoch, to events at or before it -- which are necessarily before `MRSRD_Y`,
+## where CEF has recorded no judgement. An undisturbed stand younger than `shift` initiated after the epoch without a
+## recorded cause, and is `lost` too.
+##
+## Taking `SIFA - shift` rather than `epoch - MRSRD_Y` keeps the 2024 state identical to the
+## current condition: where VRI was updated for a harvest, `SIFA` is the VRI age, which allows for
+## regeneration delay and so can be less than `2024 - MRSRD_Y`.
+backcast_age <- function(
+  x,
+  epoch,
+  data_year = 2024,
+  reset_rule = stand_reset_rule(),
+  vri_update_tolerance = 10,
+  lost_age = NA_real_
+) {
+  stopifnot(
+    length(epoch) == 1L,
+    epoch <= data_year,
+    length(lost_age) %in% c(1L, nrow(x))
+  )
+
+  shift <- data_year - epoch
+  sifa <- x$SIFA
+  mrsrd <- x$MRSRD_Y
+  has_reset <- !is.na(mrsrd) & mrsrd > 0
+
+  age <- rep(NA_real_, nrow(x))
+  src <- rep(NA_character_, nrow(x))
+  lost_age <- rep_len(as.numeric(lost_age), nrow(x))
+
+  ## no reset on record, or the reset predates the epoch: shift the current age back
+  undisturbed <- !has_reset & !is.na(sifa)
+  age[undisturbed] <- sifa[undisturbed] - shift
+  src[undisturbed] <- "undisturbed"
+
+  by_epoch <- has_reset & mrsrd <= epoch & !is.na(sifa)
+  age[by_epoch] <- pmax(sifa[by_epoch] - shift, 0)
+  src[by_epoch] <- "reset_by_epoch"
+
+  ## reset after the epoch: the age at the epoch is the age of the stand that reset replaced
+  after <- which(has_reset & mrsrd > epoch & !is.na(sifa))
+  if (length(after) > 0L) {
+    earlier <- latest_reset(x$DSTRB_HIST[after], epoch = epoch, reset_rule = reset_rule)
+    hit <- !is.na(earlier)
+    age[after[hit]] <- epoch - earlier[hit]
+    src[after[hit]] <- "earlier_reset"
+
+    ## VRI is often not updated for fire or beetle, so its age is still the pre-disturbance one.
+    ## Where it *was* updated, its age is the regenerating stand's, which can exceed the years since
+    ## disturbance by the planting-stock age: measured on Cariboo-Chilcotin harvest, the updated
+    ## population peaks at 2 years *under* and tails off by ~6 over, then falls to a flat ~1,000 ha
+    ## per year of genuine pre-harvest ages. An age within `vri_update_tolerance` of the years since
+    ## disturbance is therefore read as updated, not kept.
+    rest <- after[!hit]
+    pre <- x$PROJ_AGE_1[rest]
+    kept <- !is.na(pre) &
+      pre > data_year - mrsrd[rest] + vri_update_tolerance &
+      pre - shift >= 0
+    age[rest[kept]] <- pre[kept] - shift
+    src[rest[kept]] <- "vri_pre_disturbance"
+  }
+
+  lost <- (is.na(src) & has_reset & !is.na(sifa)) | (undisturbed & age < 0)
+  age[lost] <- lost_age[lost]
+  src[lost] <- "lost"
+
+  ## the year the unrecorded stand was replaced: the reset, or for an undisturbed stand younger
+  ## than `shift`, its initiation
+  replaced <- rep(NA_real_, nrow(x))
+  replaced[lost] <- dplyr::if_else(has_reset[lost], mrsrd[lost], data_year - sifa[lost])
+
+  x$SIFA <- age
+  x$age_source <- src
+  x$replaced_year <- replaced
+  x
+}
+
+## Stand-replacing agent and severity combinations, as CEF applies them in `MRSRD_*`: every harvest,
+## fire at moderate or high severity, beetle at very severe. Read off the layer (plan §D.0); an
+## entry without a severity matches every severity of that agent.
+cef_reset_rule <- function() {
+  c("CUT", "BRN_M", "BRN_H", "IBM_V")
+}
+
+## Split `DSTRB_HIST` into one row per event. Events are comma-separated `YEAR_AGENT_SEVERITY_SOURCE`
+## tokens, e.g. `2011_IBM_V_VRI,2007_CUT_N_VRI`; `id` is the position in `x`. Some beetle events are
+## undated (`NA_IBM_V_VRI`, 285 in Cariboo-Chilcotin); they parse with `year = NA` and so can never
+## be placed before an epoch.
+parse_disturbance_history <- function(x) {
+  tokens <- strsplit(dplyr::coalesce(x, ""), ",", fixed = TRUE)
+  id <- rep(seq_along(tokens), lengths(tokens))
+  tokens <- trimws(unlist(tokens, use.names = FALSE))
+
+  m <- regmatches(tokens, regexec("^([0-9]{4}|NA)_([A-Z]+)_([A-Z]+)_(.+)$", tokens))
+  ok <- lengths(m) == 5L
+  if (any(!ok & nzchar(tokens))) {
+    warning(
+      sum(!ok & nzchar(tokens)),
+      " DSTRB_HIST event(s) not of the form YEAR_AGENT_SEVERITY_SOURCE; ignored",
+      call. = FALSE
+    )
+  }
+  m <- do.call(rbind, m[ok])
+  if (is.null(m)) {
+    m <- matrix(character(0), ncol = 5L)
+  }
+
+  data.frame(
+    id = id[ok],
+    year = suppressWarnings(as.integer(m[, 2])),
+    agent = m[, 3],
+    severity = m[, 4],
+    source = m[, 5]
+  )
+}
+
+## The year of the latest event matching `reset_rule` at or before `epoch`; NA where there is none.
+latest_reset <- function(history, epoch, reset_rule) {
+  ev <- parse_disturbance_history(history)
+  is_reset <- ev$agent %in% reset_rule | paste(ev$agent, ev$severity, sep = "_") %in% reset_rule
+  ev <- ev[is_reset & !is.na(ev$year) & ev$year <= epoch, , drop = FALSE]
+
+  out <- rep(NA_integer_, length(history))
+  if (nrow(ev) > 0L) {
+    latest <- tapply(ev$year, ev$id, max)
+    out[as.integer(names(latest))] <- as.integer(latest)
+  }
+  out
+}
+
+# Lost pre-disturbance ages (plan §D, task D2a) ----------------------------------------------------
+
+## Ages at disturbance where VRI genuinely kept the pre-disturbance age: the donors for
+## `impute_lost_age()`. `x` needs `NDT_BEC`, `MRSRD_A`, `MRSRD_Y`, `PROJ_AGE_1` and an area column.
+## Only disturbances from `since` on are kept; each epoch then narrows to those after it (see
+## `create_forest_disturbance_seral_epoch()`), because a stand lost at an epoch was replaced after it.
+donor_ages <- function(
+  x,
+  weight = "ha",
+  since = 1995,
+  data_year = 2024,
+  vri_update_tolerance = 10
+) {
+  since_dist <- data_year - x$MRSRD_Y
+  ok <- !is.na(x$MRSRD_Y) &
+    x$MRSRD_Y >= since &
+    !is.na(x$PROJ_AGE_1) &
+    !is.na(x$NDT_BEC) &
+    x$PROJ_AGE_1 > since_dist + vri_update_tolerance
+
+  data.frame(
+    NDT_BEC = x$NDT_BEC[ok],
+    agent = x$MRSRD_A[ok],
+    year = x$MRSRD_Y[ok],
+    age = x$PROJ_AGE_1[ok] - since_dist[ok],
+    weight = x[[weight]][ok]
+  )
+}
+
+## Fill `lost` ages from the observed distribution of age at disturbance.
+##
+## A lost stand replaced in `replaced_year` is given a donor's age at disturbance, less the years
+## between the epoch and the replacement, floored at 0. Donors are matched on (`NDT_BEC`, agent); a
+## group with fewer than `min_donors` falls back to `NDT_BEC` alone, then to every donor.
+##
+## `method = "draw"` samples one donor per `unit`, area-weighted, so the filled ages follow the
+## donor distribution -- which is what seral-class areas depend on. A unit is a stand (see
+## `lost_age_units()`); without one, every polygon draws on its own. That is wrong on the real layer:
+## CEF splits a cutblock into many pieces, and drawing per piece turned one harvest into a patchwork
+## of seral classes -- 2.2-4.3x the polygons after dissolving on three 100 Mile House tiles, and so
+## spurious edges in exactly the historical landscape being compared. `method = "quantile"` gives every
+## polygon in a group the area-weighted `prob` quantile, for bounding runs (e.g. 0.1 and 0.9).
+impute_lost_age <- function(
+  x,
+  epoch,
+  donors,
+  method = c("draw", "quantile"),
+  prob = 0.5,
+  seed = epoch,
+  min_donors = 30L,
+  unit = NULL
+) {
+  method <- match.arg(method)
+  lost <- which(x$age_source %in% "lost")
+  if (length(lost) == 0L) {
+    return(x)
+  }
+
+  key_full <- paste(donors$NDT_BEC, donors$agent)
+  n_full <- table(key_full)
+  n_bec <- table(donors$NDT_BEC)
+
+  want_full <- paste(x$NDT_BEC[lost], x$MRSRD_A[lost])
+  group <- dplyr::case_when(
+    want_full %in% names(n_full)[n_full >= min_donors] ~ want_full,
+    x$NDT_BEC[lost] %in% names(n_bec)[n_bec >= min_donors] ~ x$NDT_BEC[lost],
+    .default = "<all>"
+  )
+  pool <- function(g) {
+    if (g == "<all>") {
+      return(donors)
+    }
+    donors[if (grepl(" ", g, fixed = TRUE)) key_full == g else donors$NDT_BEC == g, , drop = FALSE]
+  }
+
+  unit <- if (is.null(unit)) seq_along(lost) else unit[lost]
+
+  at_replacement <- rep(NA_real_, length(lost))
+  withr::with_seed(seed, {
+    for (g in sort(unique(group))) {
+      i <- which(group == g)
+      d <- pool(g)
+      at_replacement[i] <- if (method == "draw") {
+        u <- unique(unit[i])
+        draws <- d$age[sample.int(nrow(d), length(u), replace = TRUE, prob = d$weight)]
+        draws[match(unit[i], u)]
+      } else {
+        weighted_quantile(d$age, d$weight, prob)
+      }
+    }
+  })
+
+  x$SIFA[lost] <- pmax(at_replacement - (x$replaced_year[lost] - epoch), 0)
+  x$age_source[lost] <- "imputed"
+  x
+}
+
+## The smallest `v` whose cumulative weight reaches `prob` of the total.
+weighted_quantile <- function(v, w, prob) {
+  o <- order(v)
+  v[o][which(cumsum(w[o]) >= prob * sum(w))[1]]
+}
+
+# Epoch targets (plan §D, task D4) ---------------------------------------------------------------
+
+## Which historical epochs to build, from `BC_CONN_EPOCHS`: unset or empty builds none, `"all"` builds
+## 1995 to 2020 in 5-year steps, and a comma-separated list builds those. 2025 is the current
+## condition (plan §D.3a) and is never an epoch. The series reaches 1995 so that its first epoch
+## predates the mountain pine beetle epidemic (decided 2026-10-29); the CEF record barely covers the
+## 1999-2002 onset, so 2000 is the weak epoch until CanLaD is added (plan §5.1). Off by default because each epoch re-runs the patch chain,
+## ~16 h on Cariboo-Chilcotin.
+historical_epochs <- function(flag = Sys.getenv("BC_CONN_EPOCHS", "")) {
+  flag <- tolower(trimws(flag))
+  if (!nzchar(flag)) {
+    return(integer(0))
+  }
+  if (flag == "all") {
+    return(seq(1995L, 2020L, by = 5L))
+  }
+
+  epochs <- suppressWarnings(as.integer(trimws(strsplit(flag, ",", fixed = TRUE)[[1]])))
+  if (anyNA(epochs) || any(epochs >= 2024L)) {
+    stop("BC_CONN_EPOCHS must be \"all\" or years before 2024, e.g. \"2005,2010\"", call. = FALSE)
+  }
+  sort(unique(epochs))
+}
+
+## The forest disturbance layer overlaid with VRI-NDT-BEC, carrying the disturbance history rather
+## than a seral stage: the epoch-independent half of `create_forest_disturbance_seral()`, built once
+## and classified per epoch by `create_forest_disturbance_seral_epoch()`.
+##
+## `PROJ_AGE_1` comes from the CEF layer, which carries VRI's, so the VRI read leaves it out rather
+## than producing two columns of the same name. Landsat resets CEF does not record are merged in
+## first (`add_landsat_resets()`), exactly as for the current condition.
+create_forest_disturbance_history <- function(for_dist_gpkg, vri_gpkg, tile, resets_gpkg = NULL) {
+  aoi <- tidyterra::as_spatvector(tile)
+
+  fd <- spatialutils::read_vector_aoi(
+    for_dist_gpkg,
+    aoi,
+    fields = c("SIFA", "PROJ_AGE_1", "DSTRB_HIST", "MRSRD_Y", "MRSRD_A")
+  )
+  vri <- spatialutils::read_vector_aoi(
+    vri_gpkg,
+    aoi,
+    fields = c("NDT_BEC", "BEC_ZONE", "SPECIES_CD_1", "LEADING_GRP")
+  )
+
+  if (nrow(fd) == 0L || nrow(vri) == 0L) {
+    return(fd[integer(0)])
+  }
+
+  fd <- terra::crop(fd, aoi) |>
+    spatialutils::repair_geoms() |>
+    add_landsat_resets(resets_gpkg, aoi)
+  v <- spatialutils::intersect_relate(fd, vri) |> spatialutils::repair_geoms()
+
+  if (nrow(v) == 0L) {
+    return(v)
+  }
+
+  v$ha <- spatialutils::expanse_planar(v) / 1e4
+  v
+}
+
+## Stand membership for the `lost` pieces of `v`, so `impute_lost_age()` draws one age per stand.
+##
+## A stand is a contiguous group of lost pieces replaced in the same year by the same agent within
+## one NDT-BEC: dissolve on that key, explode, and give each piece the stand its interior point falls
+## in. Pieces that are not lost, or whose point finds no stand, are their own unit. Stands crossing a
+## tile seam are split there, so the two halves draw separately -- a small, bounded effect at 64 tiles.
+lost_age_units <- function(v, x) {
+  unit <- seq_len(nrow(x))
+  lost <- which(x$age_source %in% "lost")
+  if (length(lost) < 2L) {
+    return(unit)
+  }
+
+  pieces <- v[lost, ]
+  pieces$key <- paste(x$replaced_year[lost], x$MRSRD_A[lost], x$NDT_BEC[lost])
+  pieces <- pieces[, "key"]
+  stands <- spatialutils::dissolve_by(pieces, "key", explode = TRUE)
+  stands$stand <- seq_len(nrow(stands))
+
+  pts <- terra::centroids(pieces, inside = TRUE)
+  hit <- terra::relate(pts, stands, "intersects", pairs = TRUE)
+  ## a point on a shared boundary can touch two stands; take the one with the piece's own key
+  hit <- hit[pieces$key[hit[, 1]] == stands$key[hit[, 2]], , drop = FALSE]
+  hit <- hit[!duplicated(hit[, 1]), , drop = FALSE]
+
+  unit[lost[hit[, 1]]] <- nrow(x) + hit[, 2]
+  unit
+}
+
+## One tile's seral layer at `epoch`: back-cast the age, fill the ages CEF does not record, then
+## classify exactly as `create_forest_disturbance_seral()` does for the current condition.
+##
+## The oldest class is closed at the larger of `max_age` and the tile's oldest epoch age: a
+## back-cast from VRI's pre-disturbance age can exceed the current condition's maximum `SIFA`, and
+## an age past the last class's upper bound would match no class at all.
+create_forest_disturbance_seral_epoch <- function(
+  history,
+  epoch,
+  donors,
+  max_age,
+  tile,
+  lost_method = "draw",
+  lost_prob = 0.5
+) {
+  v <- history
+  if (nrow(v) == 0L) {
+    return(v)
+  }
+
+  x <- backcast_age(terra::as.data.frame(v), epoch = epoch)
+  x <- impute_lost_age(
+    x,
+    epoch,
+    donors[donors$year > epoch, , drop = FALSE],
+    method = lost_method,
+    prob = lost_prob,
+    seed = epoch * 100L + tile$tile[[1]],
+    unit = lost_age_units(v, x)
+  )
+
+  max_age <- max(max_age, x$SIFA, na.rm = TRUE)
+  seral <- x |>
+    dplyr::left_join(
+      seral_stages_long(max_age),
+      by = dplyr::join_by(NDT_BEC, dplyr::between(SIFA, Age_Min, Age_Max, bounds = "[)")),
+      relationship = "many-to-one"
+    )
+
+  v$SIFA <- x$SIFA
+  v$age_source <- x$age_source
+  v |>
+    dplyr::mutate(
+      Seral = !!seral$Seral,
+      early_less_20yrs = dplyr::if_else(SIFA < 20, "under_20", NA_character_)
+    )
+}
+
+# Disturbance between epochs (plan §D, task D8) --------------------------------------------------
+
+## Every recorded event placed in the interval between the epochs it falls between, so a change
+## between two epochs can be read alongside what happened in between: a beetle outbreak, a fire year.
+##
+## `x` is one row per polygon piece with `DSTRB_HIST`, `ha` and zone columns; `breaks` are the epoch
+## years plus the data year. An event in year `y` belongs to the interval `(b[i], b[i + 1]]`; undated
+## events and those outside the series are dropped. A piece is counted once per interval, agent and
+## severity, however many events of that kind it records there.
+interval_events <- function(x, breaks, zones = c("LANDSCAPE_UNIT_NAME", "BEC_ZONE")) {
+  breaks <- sort(unique(breaks))
+  ev <- parse_disturbance_history(x$DSTRB_HIST)
+  k <- findInterval(ev$year, breaks, left.open = TRUE)
+  ev$interval_end <- ifelse(k >= 1L & k < length(breaks), breaks[pmin(k + 1L, length(breaks))], NA)
+  ev <- ev[!is.na(ev$interval_end), , drop = FALSE]
+  ev$interval_start <- breaks[match(ev$interval_end, breaks) - 1L]
+  ev <- unique(ev[, c("id", "interval_start", "interval_end", "agent", "severity")])
+  ## each piece once per agent too, under severity "ALL": summing the severity rows would count a
+  ## piece with, say, both trace and very severe beetle in an interval twice
+  all_sev <- unique(ev[, c("id", "interval_start", "interval_end", "agent")])
+  all_sev$severity <- "ALL"
+  ev <- rbind(ev, all_sev)
+
+  long <- lapply(zones, function(z) {
+    data.frame(
+      zone_type = z,
+      zone = x[[z]][ev$id],
+      interval_start = ev$interval_start,
+      interval_end = ev$interval_end,
+      agent = ev$agent,
+      severity = ev$severity,
+      ha = x$ha[ev$id]
+    )
+  })
+  area <- lapply(zones, function(z) data.frame(zone_type = z, zone = x[[z]], ha = x$ha))
+
+  list(
+    disturbed = stats::aggregate(
+      ha ~ zone_type + zone + interval_start + interval_end + agent + severity,
+      data = do.call(rbind, long),
+      FUN = sum
+    ),
+    zone_area = stats::aggregate(ha ~ zone_type + zone, data = do.call(rbind, area), FUN = sum)
+  )
+}
+
+## One tile's piece table for `interval_events()`: the history overlay clipped to the UNBUFFERED
+## district (as the zonal summaries are), each piece given the landscape unit its interior point
+## falls in. Returns `interval_events()`'s two tables row-bound with a `measure` column, since a
+## branched target row-binds data frames.
+interval_disturbance_tile <- function(history, breaks, lu_gpkg, study_area_gpkg, tile) {
+  empty <- data.frame(
+    measure = character(0),
+    zone_type = character(0),
+    zone = character(0),
+    interval_start = integer(0),
+    interval_end = integer(0),
+    agent = character(0),
+    severity = character(0),
+    ha = numeric(0)
+  )
+  if (nrow(history) == 0L) {
+    return(empty)
+  }
+
+  pts <- terra::centroids(history, inside = TRUE)
+  sa <- terra::project(terra::vect(study_area_gpkg), terra::crs(history))
+  aoi <- terra::project(tidyterra::as_spatvector(tile), terra::crs(history))
+  lu <- spatialutils::read_vector_aoi(lu_gpkg, aoi, fields = "LANDSCAPE_UNIT_NAME")
+  lu <- terra::project(lu, terra::crs(history))
+
+  inside <- terra::relate(pts, terra::aggregate(sa), "intersects")[, 1]
+  if (!any(inside)) {
+    return(empty)
+  }
+  x <- terra::as.data.frame(history)[inside, , drop = FALSE]
+  pts <- pts[inside]
+
+  x$LANDSCAPE_UNIT_NAME <- NA_character_
+  if (nrow(lu) > 0L) {
+    hit <- terra::relate(pts, lu, "intersects", pairs = TRUE)
+    hit <- hit[!duplicated(hit[, 1]), , drop = FALSE]
+    x$LANDSCAPE_UNIT_NAME[hit[, 1]] <- lu$LANDSCAPE_UNIT_NAME[hit[, 2]]
+  }
+
+  out <- interval_events(x, breaks)
+  rbind(
+    cbind(measure = "disturbed", out$disturbed),
+    cbind(
+      measure = "zone_area",
+      out$zone_area[, c("zone_type", "zone")],
+      interval_start = NA_integer_,
+      interval_end = NA_integer_,
+      agent = NA_character_,
+      severity = NA_character_,
+      ha = out$zone_area$ha
+    )
+  )
+}
+
+## Combine the tiles into one table per zone, interval, agent and severity, with the share of the
+## zone affected, and flag an agent as a major disturbance in a zone and interval when, over all its
+## severities, it touched at least `threshold` of the zone's area (5%, decided 2026-10-29) -- read
+## from the `ALL` rows, which count each piece once. Every interval is reported whether flagged or
+## not; the threshold only sets the flag.
+summarise_interval_disturbance <- function(tiles, threshold = 0.05) {
+  sum_by <- function(d, by) stats::aggregate(d["ha"], d[by], sum)
+
+  area <- sum_by(tiles[tiles$measure == "zone_area", ], c("zone_type", "zone"))
+  names(area)[names(area) == "ha"] <- "zone_ha"
+
+  by <- c("zone_type", "zone", "interval_start", "interval_end", "agent", "severity")
+  d <- sum_by(tiles[tiles$measure == "disturbed", ], by) |>
+    dplyr::left_join(area, by = c("zone_type", "zone")) |>
+    dplyr::mutate(share = ha / zone_ha) |>
+    dplyr::group_by(zone_type, zone, interval_start, interval_end, agent) |>
+    dplyr::mutate(
+      agent_share = share[severity == "ALL"],
+      major = agent_share >= !!threshold
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::arrange(zone_type, zone, interval_start, agent, severity)
+
+  as.data.frame(d)
+}
+
+## Write the interval disturbance table for a district; returns the path, for a `format = "file"`
+## target.
+write_interval_disturbance <- function(tiles, dst, threshold = 0.05) {
+  utils::write.csv(summarise_interval_disturbance(tiles, threshold), dst, row.names = FALSE)
+  dst
+}

@@ -9,22 +9,25 @@
 ##
 ## `Data/raw` is deliberately NOT under the key: the provincial layers it holds are
 ## district-independent, and downloading them once is the point.
-DISTRICT <- "quesnel"
-
 ## paths
+##
+## DISTRICT-BLIND, deliberately, and it must stay that way on this branch. The writers compose
+## `file.path(get_path(<type>), dst)`, and `district_dst()` supplies `dst` as a RELATIVE subpath
+## beginning with the district key. Baking a district into the base here composes it twice --
+## `Data/processed/quesnel/chilcotin/...` -- whose parent no one creates, so every district writer
+## fails at run time with "Creation failed." while the pipeline definition still validates.
 get_path <- function(type) {
-  project_dir <- workflowtools::findProjectPath()
+  project_dir <- workflowtools::project_path()
 
   switch(
     type,
     download = file.path(project_dir, "Data", "raw") |> fs::dir_create(),
-    inputs = file.path(project_dir, "Data", "processed", DISTRICT) |> fs::dir_create(),
-    rasters = file.path(project_dir, "Data", "processed", "rasters", DISTRICT) |>
-      fs::dir_create(),
-    omniscape = file.path(project_dir, "Omniscape", DISTRICT) |> fs::dir_create(),
-    outputs = file.path(project_dir, "Outputs", DISTRICT) |> fs::dir_create(),
+    inputs = file.path(project_dir, "Data", "processed") |> fs::dir_create(),
+    rasters = file.path(project_dir, "Data", "processed", "rasters") |> fs::dir_create(),
+    omniscape = file.path(project_dir, "Omniscape") |> fs::dir_create(),
+    outputs = file.path(project_dir, "Outputs") |> fs::dir_create(),
     project = fs::path(project_dir),
-    figures = file.path(project_dir, "Outputs", DISTRICT, "figures") |> fs::dir_create(),
+    figures = file.path(project_dir, "Outputs", "figures") |> fs::dir_create(),
   )
 }
 
@@ -130,7 +133,7 @@ write_reproducibility_receipt <- function(dst = "INFO.md") {
     unlink(dst)
   }
 
-  workflowtools::reproducibilityReceipt(writeTo = dst)
+  workflowtools::reproducibility_receipt(writeTo = dst)
 
   return(dst)
 }
@@ -159,6 +162,45 @@ get_quesnel_NRD_boundary <- function(file, buffer = FALSE) {
     sf::st_buffer(Quesnel_TSA, 500 * 30) ## add 500-pixel buffer to mitigate edge-effects
   } else {
     Quesnel_TSA
+  }
+}
+
+#' Natural Resource District boundary, for any district
+#'
+#' The generic form of [get_quesnel_NRD_boundary()], used by the multi-district factories.
+#'
+#' `get_quesnel_NRD_boundary()` is deliberately left untouched rather than reimplemented in terms
+#' of this: `targets` hashes function bodies, so editing it would invalidate `Quesnel_TSA` and
+#' every target downstream of it -- 280 h of stored work at the time of writing.
+#'
+#' @param file path to the BCGW `ADM_NR_DISTRICTS_SP` shapefile; falls back to [bcmaps::nr_districts()]
+#' @param district_name character, a value of `DSTRCT_NM` (e.g. "Cariboo-Chilcotin Natural Resource District")
+#' @param buffer if `TRUE`, add the 500-pixel (15 km) edge-effect buffer
+#'
+#' @returns `sf` polygon with a single `DIST_NAME` column
+#'
+#' @export
+get_NRD_boundary <- function(file, district_name, buffer = FALSE) {
+  if (file.exists(file)) {
+    boundary <- sf::st_read(file, quiet = TRUE) |>
+      dplyr::filter(.data$DSTRCT_NM == district_name) |>
+      dplyr::select("DSTRCT_NM") |>
+      dplyr::rename(DIST_NAME = "DSTRCT_NM")
+  } else {
+    boundary <- bcmaps::nr_districts() |>
+      dplyr::filter(.data$DISTRICT_NAME == district_name) |>
+      dplyr::select("DISTRICT_NAME") |>
+      dplyr::rename(DIST_NAME = "DISTRICT_NAME")
+  }
+
+  if (nrow(boundary) == 0L) {
+    stop("no district matched \"", district_name, "\" in ", file)
+  }
+
+  if (isTRUE(buffer)) {
+    sf::st_buffer(boundary, 500 * 30) ## 500-pixel buffer to mitigate edge-effects
+  } else {
+    boundary
   }
 }
 
@@ -380,6 +422,30 @@ get_mdwr <- function(studyArea, rasterToMatch) {
     studyArea = studyArea,
     rasterToMatch = rasterToMatch
   )
+}
+
+## The MDWR record has returned HTTP 403 from the BC Data Catalogue since at least 2026-10-29, metadata
+## included, so `get_mdwr()` can no longer run. Each district reads instead the copy `get_mdwr()`
+## fetched before then: the `MDWR` object from that district's store, copied byte for byte into
+## `Data/raw/MDWR/<district>.rds`. It is already cropped to the buffered study area and projected.
+mdwr_snapshot_path <- function(district) {
+  path <- file.path(district_path("download", district), "MDWR", paste0(district$key, ".rds"))
+
+  if (!file.exists(path)) {
+    stop(glue::glue(
+      "Required input `MDWR/{basename(path)}` not found at:\n  {path}\n\n",
+      "The Mule Deer Winter Range layer (BC Data Catalogue a60d7b6e-88b2-4105-95e2-aaf6cc3468cf) ",
+      "is no longer publicly available and cannot be downloaded automatically.\n",
+      "To request a copy, contact Travis Heckford <Travis.Heckford@gov.bc.ca>.\n",
+      "See the 'Data access' section of the README for details."
+    ))
+  }
+
+  path
+}
+
+read_mdwr_snapshot <- function(path) {
+  readRDS(path)
 }
 
 get_wha <- function(studyArea, rasterToMatch) {
@@ -750,6 +816,16 @@ get_human_disturbance <- function(studyArea, rasterToMatch) {
 ## Forest disturbance data must be downloaded manually as it is not available
 ## through the bcdata package (CEF Custom Product) and is not publicly distributed.
 ## See the 'Data access' section of the README for how to request it.
+##
+## The layer overlaps itself as delivered: 76.6 ha in Quesnel, 12,349 ha in 100 Mile House and
+## 25,229 ha in Cariboo-Chilcotin, mostly a small stand nested in a larger one with the same history.
+## Every overlay downstream keeps both copies, double counting the area, and the near-coincident
+## edges made the patch dissolve fail outright (`TopologyException`). `flatten_overlaps()` gives
+## each overlap to the youngest stand (decided 2026-11-10; see the stand-age section of
+## `reports/methods.qmd`). In 100 Mile House and Cariboo-Chilcotin 99% of the overlap area lies
+## between polygons with the same SIFA and history, so the rule matters only for the rest, where
+## the two typically differ by 50-155 years: one records a stand-replacing event and the other does
+## not. Keeping the younger honours the recorded event rather than overwriting it with old forest.
 
 get_forest_disturbance <- function(studyArea, rasterToMatch) {
   for_dist_gdb <- file.path(get_path("download"), "BC_CEF_Forest_Disturbance_2024.gdb")
@@ -774,7 +850,104 @@ get_forest_disturbance <- function(studyArea, rasterToMatch) {
     sf::st_set_agr("constant") |>
     sf::st_crop(studyArea) |>
     dplyr::mutate(fid = NULL) |> ## fid will be recreated to be unique etc. during save
-    sf::st_transform(terra::crs(rasterToMatch))
+    sf::st_transform(terra::crs(rasterToMatch)) |>
+    ## reprojection can reintroduce self-intersections, and the crop leaves lines and collections
+    ## (222 lines and 106 collections in 100 Mile House); the overlay in flatten_overlaps() fails on
+    ## either, so repair and keep only polygons first
+    sf::st_make_valid() |>
+    spatialutils::keep_polygons() |>
+    flatten_overlaps(priority = "SIFA", min_area = units::set_units(1, "ha"))
+}
+
+## Remove overlaps between features of `x`, so it partitions its footprint.
+##
+## Where features overlap, the area goes to the one with the lowest `priority` value (for CEF,
+## the youngest stand, so a recorded disturbance is never overwritten by an older stand); ties go to
+## the earlier row, and `NA` ranks last. Each feature loses the original footprint of every
+## higher-ranked feature it overlaps, which assigns every point to the highest-ranked feature
+## covering it without iterating. Features left empty are dropped. With `min_area`, the pieces of
+## cut features smaller than it are merged into a neighbour (`eliminate_cut_slivers()`).
+flatten_overlaps <- function(x, priority, min_area = NULL) {
+  rank <- order(order(x[[priority]], seq_len(nrow(x)), na.last = TRUE))
+  ## "2********": the interiors meet in an area; features that only share an edge are left alone.
+  ## GEOS 3.15 also matches a stand that exactly fills another's holes (as does st_intersection(),
+  ## by the holes' whole area); the difference is then a no-op, so it costs time, not correctness
+  hits <- sf::st_relate(x, pattern = "2********")
+  winners <- lapply(seq_along(hits), function(i) {
+    j <- hits[[i]]
+    j[rank[j] < rank[i]]
+  })
+  losers <- which(lengths(winners) > 0L)
+  if (length(losers) == 0L) {
+    return(x)
+  }
+
+  g <- sf::st_geometry(x)
+  area_before <- as.numeric(sf::st_area(g[losers]))
+  empty <- sf::st_sfc(sf::st_polygon(), crs = sf::st_crs(g))
+  g[losers] <- do.call(
+    c,
+    lapply(losers, function(i) {
+      d <- suppressWarnings(sf::st_difference(g[i], sf::st_union(g[winners[[i]]])))
+      ## st_difference() drops a result that comes out empty, which would shift every later row
+      if (length(d) == 0L) empty else d
+    })
+  )
+  sf::st_geometry(x) <- g
+  ## "cut" by area actually lost, not by `losers`, so a hole-filling false match (above) is not cut
+  x$.cut <- FALSE
+  x$.cut[losers] <- as.numeric(sf::st_area(g[losers])) < area_before - 0.01
+  x <- spatialutils::keep_polygons(x)
+
+  if (!is.null(min_area) && any(x$.cut)) {
+    x <- eliminate_cut_slivers(x, min_area)
+  }
+  x$.cut <- NULL
+  x
+}
+
+## Merge the pieces of cut features (`.cut`) smaller than `min_area` into the neighbour they share
+## the longest border with -- the arcpy `Eliminate` LENGTH rule used for the patches (step 2). Only
+## what flattening leaves behind is touched: features that were not cut are kept whatever their
+## size, so small stands delivered as such survive (decided 2026-11-12). Pieces of a cut feature
+## that are large enough stay separate rows carrying its attributes.
+eliminate_cut_slivers <- function(x, min_area) {
+  x$.row <- seq_len(nrow(x))
+  pieces <- suppressWarnings(sf::st_cast(sf::st_cast(x[x$.cut, ], "MULTIPOLYGON"), "POLYGON"))
+  y <- rbind(x[!x$.cut, ], pieces)
+  y <- y[order(y$.row), ]
+  min_m2 <- if (inherits(min_area, "units")) {
+    as.numeric(units::set_units(min_area, "m^2"))
+  } else {
+    as.numeric(min_area)
+  }
+  ## terra::combineGeoms() leaves some slivers unmerged even though they share an edge with a
+  ## neighbour, and which ones depends on the other features passed in with them. A second pass over
+  ## the leftovers takes them too: in 100 Mile House, 2,125 slivers (155.5 ha) left 39 (984 m2)
+  ## after one pass, 23 (1.5 m2) after two, and a third changed nothing
+  n_left <- Inf
+  for (pass in 1:3) {
+    sliver <- y$.cut & as.numeric(sf::st_area(y)) <= min_m2
+    if (sum(sliver) == 0L || sum(sliver) >= n_left) {
+      break
+    }
+    n_left <- sum(sliver)
+
+    ## a sliver can only merge into a feature it touches, so run the elimination on those alone:
+    ## over the whole layer it took 11 h in 100 Mile House, against 32 min for the flattening
+    near <- sliver
+    near[unique(unlist(sf::st_intersects(y[sliver, ], y)))] <- TRUE
+    merged <- spatialutils::eliminate_slivers(
+      y[near, ],
+      threshold = min_area,
+      keep = !.cut,
+      explode = FALSE
+    )
+    y <- rbind(y[!near, ], merged)
+    y <- y[order(y$.row), ]
+  }
+  y$.row <- NULL
+  y
 }
 
 ## Forest disturbance overlaid with VRI-NDT-BEC, then classified into seral stages.
@@ -786,7 +959,16 @@ get_forest_disturbance <- function(studyArea, rasterToMatch) {
 ## inflated the layer from 4.02 M polygons / 4.09 Mha to 7.78 M polygons / 39.5 Mha, and left
 ## ~165,000 ha (6% of the landscape) belonging to two or more seral stages at once, resolved
 ## arbitrarily by whichever union happened to run first downstream.
-create_forest_disturbance_seral <- function(for_dist_gpkg, vri_gpkg, tile, max_age) {
+##
+## `resets_gpkg` adds the stand-replacing fire and insect mortality CEF does not record, from
+## CanLaD/CanLaBS, before ages are classified; see `R/landsat_resets.R`. `NULL` uses CEF alone.
+create_forest_disturbance_seral <- function(
+  for_dist_gpkg,
+  vri_gpkg,
+  tile,
+  max_age,
+  resets_gpkg = NULL
+) {
   aoi <- tidyterra::as_spatvector(tile)
 
   ## Push the spatial filter down to the GDAL read: only the features overlapping this tile are
@@ -796,7 +978,12 @@ create_forest_disturbance_seral <- function(for_dist_gpkg, vri_gpkg, tile, max_a
   ## because `forest_disturbance_seral.gpkg` is a deliverable in its own right and they are what
   ## make it interpretable. The source-system artifacts (`id`, `FEATURE_ID`, `OBJECTID`) are
   ## deliberately not carried, and `NATURAL_DISTURBANCE`/`ZONE` are recoverable from `NDT_BEC`.
-  fd <- spatialutils::read_vector_aoi(for_dist_gpkg, aoi, fields = "SIFA")
+  ## the history fields are read only to merge in the Landsat resets, and dropped once they are
+  fd <- spatialutils::read_vector_aoi(
+    for_dist_gpkg,
+    aoi,
+    fields = c("SIFA", if (!is.null(resets_gpkg)) c("DSTRB_HIST", "MRSRD_Y", "MRSRD_A"))
+  )
   vri <- spatialutils::read_vector_aoi(
     vri_gpkg,
     aoi,
@@ -808,7 +995,10 @@ create_forest_disturbance_seral <- function(for_dist_gpkg, vri_gpkg, tile, max_a
   }
 
   ## clip to the tile so tiles partition the study area rather than overlapping at their edges
-  fd <- terra::crop(fd, aoi) |> spatialutils::repair_geoms()
+  fd <- terra::crop(fd, aoi) |>
+    spatialutils::repair_geoms() |>
+    add_landsat_resets(resets_gpkg, aoi)
+  fd <- fd[, "SIFA"]
 
   v <- spatialutils::intersect_relate(fd, vri) |> spatialutils::repair_geoms()
 
@@ -1171,6 +1361,11 @@ SERAL_UNCLASSIFIED <- "<unclassified>"
 ## Seral stages in stand-development order, which is the order they belong in on a plot or in a
 ## table. Alphabetical puts Mature before Mid, which reads as an error to anyone who knows the
 ## sequence.
+##
+## `seral_stages_long()` carries the same order as a literal and is deliberately left that way for
+## now: it is upstream of the seral layer, so changing its body would invalidate every district
+## store for a change that alters no value. Unify the two when something else invalidates them
+## anyway.
 SERAL_LEVELS <- c("Early", "Mid", "Mature", "Old")
 
 ## Rasterise the seral layer for display.
